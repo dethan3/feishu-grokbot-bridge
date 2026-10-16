@@ -1,0 +1,9 @@
+.env
+*.env
+!.env.example
+run/
+bots/
+.venv/
+__pycache__/
+.pytest_cache/
+*.log
