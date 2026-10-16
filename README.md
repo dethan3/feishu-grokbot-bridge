@@ -1,34 +1,62 @@
 # feishu-grokbot-bridge
 
-把飞书（Lark）机器人收到的消息转发到 **Grok Bot webhook routine** 的轻量桥接器。纯 Python 标准库 + [`lark-cli`](https://github.com/larksuite)，无需公网回调地址。
+把飞书（Lark）机器人收到的消息转发到 **Grok Bot webhook routine** 的轻量桥接器。纯 Python 标准库 + [`lark-cli`](https://github.com/larksuite/cli)（长连接，无需公网 IP / 回调地址）。
+
+## 一键安装（Ubuntu / Debian / CentOS / Alibaba Cloud Linux，x86_64 / arm64）
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dethan3/feishu-grokbot-bridge/main/install.sh | sudo bash
+```
+
+安装脚本会：安装 `python3` 等依赖（apt / dnf / yum）→ 安装打过补丁的 `lark-cli`（1.0.98 + oapi-sdk-go v3.12.2，修复长连接“假死”；随仓库 `bin/` 提供，校验 SHA256；不可用时回退官方 npm `@larksuite/cli`）→ 交互式询问配置 → 写入 `/etc/feishu-grokbot-bridge.env`（chmod 600）→ 安装并启动 systemd 服务 `feishu-grokbot-bridge`（`Restart=always`、`RestartSec=3`、开机自启）。即使通过管道运行，提示也会从 `/dev/tty` 读取；密钥输入不回显。
+
+需要提前准备：
+
+| 项目 | 在哪里找 |
+|---|---|
+| App ID（`cli_...`） | [飞书开放平台](https://open.feishu.cn/app) → 你的应用 → **凭证与基础信息** |
+| App Secret | 同上 **凭证与基础信息**（安装时隐藏输入；会用 `lark-cli config init --app-secret-stdin` 在线校验） |
+| 主人 open_id（`ou_...`，可多个逗号分隔） | 应用内的用户 open_id；可在开放平台「API 调试台」调用获取用户信息，或看本项目日志中 `skip ... from ou_...` |
+| 机器人 open_id（`ou_...`） | 安装时会用 App 凭证自动获取并作为默认值，直接回车即可 |
+| Grok Bot webhook URL 与 key | Grok Bot 中对应 webhook routine 的侧边栏（key 隐藏输入） |
+
+可选参数：`--dry-run`（只打印不改动）、`--no-start`；环境变量 `GH_PROXY=https://你的镜像/`（国内访问 GitHub 慢时给 github.com 下载加前缀）；也可预先设置 `FEISHU_APP_ID` `FEISHU_APP_SECRET` `FEISHU_OWNER_OPEN_IDS` `FEISHU_BOT_OPEN_ID` `FEISHU_WEBHOOK_URL` `FEISHU_WEBHOOK_KEY` 实现无人值守安装。重复运行即升级，回车保留旧值。
+
+```bash
+journalctl -u feishu-grokbot-bridge -f            # 实时日志
+systemctl status|restart|stop feishu-grokbot-bridge
+LARKSUITE_CLI_CONFIG_DIR=/var/lib/feishu-grokbot-bridge/lark-cli lark-cli event status
+```
+
+**注意：同一个飞书应用只能有一个消费者。** 新服务器跑起来后，务必停掉其它机器上的旧转发器，否则事件会被两边分摊。
 
 ## 它做什么
 
-- 通过 `lark-cli event consume im.message.receive_v1 --as bot` 以长连接方式订阅消息事件（无需公网 IP / 回调 URL）
-- 只转发白名单用户（`FEISHU_OWNER_OPEN_IDS`）的消息
-- 群聊：只有 **@本机器人** 或 **@所有人** 的消息才会转发；单聊全部转发
-- 按 `message_id` 去重（持久化，重启不重复）
-- 以 `Authorization: Bearer $FEISHU_WEBHOOK_KEY` POST 如下 JSON：
+- `lark-cli event consume im.message.receive_v1 --as bot` 长连接接收消息
+- **角色**：主人（`FEISHU_OWNER_OPEN_IDS`）的消息在单聊和群聊都转发，`role=owner`；其他人（guest）只有在**群聊中 @本机器人 或 @所有人** 时才转发，`role=guest`
+- 跳过机器人自己发的消息；按 `message_id` 持久化去重；超过 15 分钟的旧消息（重连后的补投）跳过
+- **轮询兜底**：每 90 秒用 API 拉取已知群/会话最近 5 分钟的消息，补发长连接漏掉的
+- 以 `Authorization: Bearer $FEISHU_WEBHOOK_KEY` POST：
   ```json
-  {"message_id":"om_...","chat_id":"oc_...","chat_type":"p2p|group","sender_open_id":"ou_...",
+  {"message_id":"om_...","chat_id":"oc_...","chat_type":"p2p|group","sender_open_id":"ou_...","role":"owner|guest",
    "message_type":"text","text":"...","create_time":"1700000000000"}
   ```
-- 失败的请求写入磁盘队列，每 60 秒按顺序重试（有积压时新消息也先入队，保证顺序）
-- 单实例锁；watchdog 负责进程死亡/事件总线断开时重启，并每 30 分钟主动重连
-- `scripts/reply.sh` 以机器人身份回复消息，失败自动入队重试
+- 失败写入磁盘队列，每 60 秒按顺序重试；`scripts/reply.sh <chat_id> <message_id> <文本>` 以机器人身份回复，失败自动入队重试
+- **轻量 watchdog**（内置）：直连网络下依赖 SDK 自动重连；只有当 bus.log 出现断线且之后 60 秒内没有任何总线活动时，才停止事件总线并退出，由 systemd 3 秒后拉起
 
-## 架构
+## 配置（`/etc/feishu-grokbot-bridge.env`）
 
-```
-飞书开放平台 ──长连接──> lark-cli event bus ──NDJSON──> bridge/forwarder.py
-                                                        │ 过滤(owner/群@) → 去重(seen_ids.txt)
-                                                        ├─ POST ─> Grok Bot webhook
-                                                        └─ 失败 ─> <work>/outbox-webhook/ ─(60s 重试)
-Grok Bot ── scripts/reply.sh ──> lark-cli im +messages-reply ─(失败)─> <work>/outbox/ ─(60s 重试)
-scripts/watchdog.sh: 每 60s 健康检查（进程存活 + `lark-cli event status`），每 30min 预防性重连
-```
+| 变量 | 说明 |
+|---|---|
+| `FEISHU_APP_ID` | 应用 App ID |
+| `FEISHU_OWNER_OPEN_IDS` | 主人 open_id，逗号分隔 |
+| `FEISHU_BOT_OPEN_ID` | 机器人 open_id（识别 @bot、跳过自身消息） |
+| `FEISHU_WEBHOOK_URL` / `FEISHU_WEBHOOK_KEY` | Grok Bot webhook 地址 / Bearer key（每次发送时重新读取，改 key 无需重启） |
+| `BRIDGE_WORK_DIR` | 状态目录，默认 `/var/lib/feishu-grokbot-bridge`（seen_ids、队列、chats.txt） |
+| `LARKSUITE_CLI_CONFIG_DIR` / `LARK_CLI` | lark-cli 配置目录 / 可执行文件 |
+| 可选 | `FEISHU_SEED_CHATS` `POLL_EVERY`(90) `POLL_WINDOW`(300) `STALE_SEC`(900) `RETRY_EVERY`(60) `SEEN_MAX`(5000) `WATCHDOG_QUIET_AFTER_DISCONNECT`(60) `WATCHDOG_SILENCE_MAX`(0=关闭) `BRIDGE_LOG_FILE` |
 
-每个实例的状态都在 `BRIDGE_WORK_DIR`（默认 `run/default`）：`forwarder.log`、`seen_ids.txt`、队列目录、pid/lock 文件。
+App Secret 不写入此文件，只保存在 lark-cli 配置目录（权限 700）。
 
 ## 飞书权限配置
 
@@ -46,79 +74,30 @@ scripts/watchdog.sh: 每 60s 健康检查（进程存活 + `lark-cli event statu
 - **外部群**：机器人默认不能进外部群。需在应用设置中允许「对外共享 / 外部群可用」，并且群需允许添加外部机器人；否则加不进群或收不到事件。
 - `@所有人` 能否触发事件取决于权限：仅有 `group_at_msg` 时，部分情况下 @所有人 不推送，需要 `im:message.group_msg`。
 
-## 安装
+## 无 systemd 的环境
 
-```bash
-# 1. 安装并登录 lark-cli（放在 ~/.local/bin 或 PATH 中）
-lark-cli config init         # 填入 App ID / App Secret
-lark-cli event status        # 确认可用
-# 2. 获取代码
-git clone https://github.com/dethan3/feishu-grokbot-bridge.git && cd feishu-grokbot-bridge
-cp .env.example .env && chmod 600 .env && $EDITOR .env
-```
-
-需要 Python ≥ 3.8、bash、`flock`（util-linux）。
-
-## 配置
-
-| 变量 | 说明 |
-|---|---|
-| `FEISHU_OWNER_OPEN_IDS` | 允许的发送者 open_id，逗号分隔 |
-| `FEISHU_BOT_OPEN_ID` | 本机器人 open_id，用于识别群内 @；留空则群聊只转发 @所有人 |
-| `FEISHU_WEBHOOK_URL` | Grok Bot webhook routine 地址 |
-| `FEISHU_WEBHOOK_KEY` | Bearer key |
-| `BRIDGE_WORK_DIR` | 实例目录（相对仓库根目录或绝对路径） |
-| `LARK_CLI` / `LARK_CLI_EXTRA_ARGS` | lark-cli 路径 / 额外全局参数（多机器人时选择不同配置） |
-| `RETRY_EVERY` `SEEN_MAX` `WATCHDOG_CHECK_EVERY` `WATCHDOG_RECONNECT_EVERY` | 可选调优 |
-
-webhook URL/KEY 每次发送时重新读取，轮换 key 无需重启。
-
-**多个机器人**：每个机器人一个配置文件 + 独立 `BRIDGE_WORK_DIR`，例如 `bots/a.env`（`BRIDGE_WORK_DIR=run/a`）与 `bots/b.env`（`BRIDGE_WORK_DIR=run/b`），所有脚本第一个参数传配置文件路径。每个机器人需要各自的 lark-cli 应用凭证（通过 `LARK_CLI_EXTRA_ARGS` 或不同的 `HOME`/配置目录区分）。
-
-## 运行
-
-```bash
-scripts/start.sh [bots/a.env]      # 启动（已在运行则跳过）
-scripts/stop.sh  [bots/a.env]      # 停止
-nohup scripts/watchdog.sh [bots/a.env] >/dev/null 2>&1 &   # 守护
-tail -f run/default/forwarder.log
-BRIDGE_ENV_FILE=.env scripts/reply.sh <chat_id> <message_id> "收到"
-```
-
-不传参数时使用仓库根目录的 `.env`。
-
-## Watchdog
-
-`scripts/watchdog.sh` 每 60 秒检查：forwarder 进程是否存活；`lark-cli event status` 是否显示 `Bus: running` 且 `Active consumers` ≥ 1。任一失败即重启；另外每 30 分钟预防性重启一次，规避长连接“静默断开”。日志写入同一个 `forwarder.log`（前缀 `WATCHDOG`）。
-
-## 重启恢复
-
-机器重启后进程不会自动恢复。推荐 crontab：
-
-```cron
-@reboot cd /path/to/feishu-grokbot-bridge && scripts/start.sh .env && nohup scripts/watchdog.sh .env >/dev/null 2>&1 &
-```
-
-或写一个 systemd user service 运行 `scripts/watchdog.sh`（watchdog 会在 60 秒内拉起 forwarder）。去重表和队列都在磁盘上，重启后自动继续重试。
+安装脚本会自动改用 `scripts/start.sh`（循环重启）与 `scripts/stop.sh`，日志在 `$BRIDGE_WORK_DIR/forwarder.log`；需要自行加 `@reboot /opt/feishu-grokbot-bridge/scripts/start.sh` 到 crontab。
 
 ## 故障排查
 
-- **静默断开（进程在但收不到消息）**：长连接可能无报错地失效。看 `lark-cli event status`；watchdog 的 30 分钟重连就是为此。手动：`scripts/stop.sh && scripts/start.sh`。
-- **单聊正常、群里收不到事件**：检查 `im:message.group_at_msg:readonly` 是否已开通 **且新版本已发布**；机器人是否在群里；是否真的 @ 了机器人（而非同名用户）；外部群见上文。日志中 `skip ... group message without @bot/@all` 说明事件到了但被过滤——检查 `FEISHU_BOT_OPEN_ID`。
-- **日志里 `skip ... sender not owner`**：把发送者的 open_id（日志里可见）加入 `FEISHU_OWNER_OPEN_IDS`。注意 open_id 是 **按应用区分** 的，不同机器人看到的同一个人 open_id 不同。
-- **`queued ...`**：webhook 不可达或返回非 2xx，检查 URL/KEY；队列在 `<work>/outbox-webhook/`。
-- **`another forwarder is running`**：同一实例目录已有进程；多机器人请使用不同 `BRIDGE_WORK_DIR`。
+- **群里收不到**：确认 `im:message.group_at_msg:readonly` 已开通且新版本已发布、机器人在群里、确实 @ 了机器人。日志 `skip ... guest without @bot/@all` 表示事件到了但被过滤。
+- **`skip ... guest outside group`**：非主人单聊不转发；把对方 open_id 加进 `FEISHU_OWNER_OPEN_IDS`（open_id 按应用区分）。
+- **`queued ...`**：webhook 不可达或非 2xx，检查 URL/KEY；队列在 `/var/lib/feishu-grokbot-bridge/outbox-webhook/`。
+- **`watchdog restart`**：检测到断线后总线静默，已自动重启，属正常自愈。
+
+## 自行编译 lark-cli 补丁版
+
+`bin/lark-cli-linux-{amd64,arm64}.gz` 由 [larksuite/cli](https://github.com/larksuite/cli) v1.0.98 将 `github.com/larksuite/oapi-sdk-go/v3` 升级到 v3.12.2 后编译（`CGO_ENABLED=0 go build -trimpath -ldflags "-s -w"`），校验和见 `bin/SHA256SUMS`。
 
 ## 测试
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install pytest && .venv/bin/pytest -q
+bash install.sh --dry-run
 ```
 
 ---
 
 ## English
 
-**feishu-grokbot-bridge** forwards Feishu/Lark bot messages to a Grok Bot webhook routine. It wraps `lark-cli event consume im.message.receive_v1 --as bot` (long connection, no public callback URL), forwards only messages from whitelisted open_ids (`FEISHU_OWNER_OPEN_IDS`), and in groups only when the message @-mentions this bot (`FEISHU_BOT_OPEN_ID`) or @all. It dedupes by `message_id`, POSTs a compact JSON payload with `Authorization: Bearer $FEISHU_WEBHOOK_KEY`, queues failures on disk and retries every 60 s in order, and holds a single-instance lock per work dir. `scripts/watchdog.sh` restarts it if the process dies or the event bus goes down, and reconnects every 30 min to avoid silent disconnects. Run several bots with one env file and work dir each.
-
-Quick start: `cp .env.example .env`, fill it in, `scripts/start.sh`, `nohup scripts/watchdog.sh &`. Required scopes: `im:message.p2p_msg:readonly`, `im:message.group_at_msg:readonly` (groups), optionally `im:message.group_msg`; subscribe to `im.message.receive_v1` via long connection and publish a new app version. License: MIT.
+One-line install on a Linux server (root): `curl -fsSL https://raw.githubusercontent.com/dethan3/feishu-grokbot-bridge/main/install.sh | sudo bash`. It installs python3 and a patched lark-cli (1.0.98 + oapi-sdk-go v3.12.2), prompts (via /dev/tty) for App ID, App Secret (hidden), owner open_id(s), bot open_id (auto-detected), webhook URL and key (hidden), writes `/etc/feishu-grokbot-bridge.env` (600), and runs the `feishu-grokbot-bridge` systemd service (`Restart=always`). Owners are forwarded everywhere; guests only in groups when they @bot or @all; own messages skipped; dedupe by message_id; messages older than 15 min skipped; 90 s polling backup; disk retry queue. Logs: `journalctl -u feishu-grokbot-bridge -f`. Only one consumer per Feishu app may run at a time. License: MIT.
