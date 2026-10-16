@@ -245,7 +245,7 @@ class Bridge:
         return "queued"
 
     def run_lark(self, args, timeout=60):
-        return subprocess.run(self.lark + args, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        return subprocess.run(self.lark + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=timeout, stdin=subprocess.DEVNULL)
 
     def retry_loop(self):
         while True:
@@ -385,7 +385,7 @@ class Bridge:
             start = time.time()
             self.proc = p = subprocess.Popen(self.lark + ["event", "consume", "im.message.receive_v1", "--as", "bot"],
                                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                             text=True, bufsize=1)
+                                             universal_newlines=True, bufsize=1)
             threading.Thread(target=lambda: [log.info("[lark] %s", l.rstrip()) for l in p.stderr], daemon=True).start()
             for line in p.stdout:
                 line = line.strip()
