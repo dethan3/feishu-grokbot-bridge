@@ -4,7 +4,7 @@
 Wraps `lark-cli event consume im.message.receive_v1 --as bot`; all IDs/secrets come from an env file
 (default /etc/feishu-grokbot-bridge.env, override with BRIDGE_ENV_FILE or argv[1]).
 
-Features: owner vs guest roles (guests only in groups when @bot or @all), skip the bot's own messages,
+Features: owner vs guest roles (in groups only messages that @bot or @all are forwarded; guests never in DMs), skip the bot's own messages,
 persistent message_id dedupe, skip messages older than STALE_SEC, polling backup of known chats every
 POLL_EVERY seconds, on-disk retry queues, and a light bus watchdog (restart if the SDK logged a
 disconnect and the bus then stayed silent).
@@ -74,9 +74,12 @@ def classify(ev, owners, bot_open_id):
     sender = ev.get("sender_id") or ""
     if bot_open_id and sender == bot_open_id:
         return None, "self"
+    in_group = ev.get("chat_type") == "group"
     if sender in owners:
+        if in_group and not is_mentioned(ev, bot_open_id):
+            return None, "owner in group without @bot"
         return "owner", "owner"
-    if ev.get("chat_type") != "group":
+    if not in_group:
         return None, "guest outside group"
     if not is_mentioned(ev, bot_open_id):
         return None, "guest without @bot/@all"
