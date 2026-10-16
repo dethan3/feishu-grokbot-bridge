@@ -53,7 +53,7 @@ scripts/watchdog.sh: 每 60s 健康检查（进程存活 + `lark-cli event statu
 lark-cli config init         # 填入 App ID / App Secret
 lark-cli event status        # 确认可用
 # 2. 获取代码
-git clone <this repo> && cd feishu-grokbot-bridge
+git clone https://github.com/dethan3/feishu-grokbot-bridge.git && cd feishu-grokbot-bridge
 cp .env.example .env && chmod 600 .env && $EDITOR .env
 ```
 
