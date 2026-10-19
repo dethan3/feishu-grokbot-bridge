@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # feishu-grokbot-bridge one-click installer (Ubuntu/Debian/CentOS/Alibaba Cloud Linux; apt/dnf/yum).
 #   curl -fsSL https://raw.githubusercontent.com/dethan3/feishu-grokbot-bridge/main/install.sh | sudo bash
+#   ... | sudo bash -s -- --instance xiaoi --app-name 小i --guest-p2p    # extra instance for another Feishu app
 # Options (env vars or flags):
+#   --instance NAME           instance name (default: "default" = original paths/service name)
+#   --app-name NAME           value of "app" in webhook payload (default: instance name)
+#   --guest-p2p / --no-guest-p2p  forward non-owner direct messages (default off; kept on re-run)
 #   --dry-run / DRY_RUN=1     print what would be done, change nothing
 #   --no-start                install but do not start the service
 #   GH_PROXY=https://mirror/  prefix for github.com downloads (if GitHub is slow from mainland China)
@@ -12,18 +16,33 @@ set -euo pipefail
 REPO="${BRIDGE_REPO:-dethan3/feishu-grokbot-bridge}"
 BRANCH="${BRIDGE_BRANCH:-main}"
 LARK_TAG="${LARK_CLI_TAG:-lark-cli-v1.0.98-sdk3.12.2}"
-NAME=feishu-grokbot-bridge
-PREFIX="${BRIDGE_PREFIX:-/opt/$NAME}"
-ENV_FILE="${BRIDGE_ENV_FILE:-/etc/$NAME.env}"
-WORK="${BRIDGE_WORK_DIR:-/var/lib/$NAME}"
-LARK_BIN="${LARK_BIN:-/usr/local/bin/lark-cli}"
-UNIT="/etc/systemd/system/$NAME.service"
+BASE=feishu-grokbot-bridge
 GH_PROXY="${GH_PROXY:-}"
 DRY_RUN="${DRY_RUN:-0}"; NO_START=0
-for a in "$@"; do case "$a" in
+INSTANCE="${BRIDGE_INSTANCE:-}"; APP_NAME_ARG="${FEISHU_APP_NAME:-}"; GUEST_P2P_ARG="${FEISHU_GUEST_P2P:-}"
+while [ $# -gt 0 ]; do case "$1" in
   --dry-run) DRY_RUN=1;; --no-start) NO_START=1;;
-  -h|--help) sed -n '2,10p' "$0" 2>/dev/null || true; exit 0;;
-  *) echo "unknown option: $a" >&2; exit 2;; esac; done
+  --instance) INSTANCE="${2:-}"; shift;; --instance=*) INSTANCE="${1#*=}";;
+  --app-name) APP_NAME_ARG="${2:-}"; shift;; --app-name=*) APP_NAME_ARG="${1#*=}";;
+  --guest-p2p) GUEST_P2P_ARG=1;; --no-guest-p2p) GUEST_P2P_ARG=0;;
+  -h|--help) sed -n '2,16p' "$0" 2>/dev/null || true; exit 0;;
+  *) echo "unknown option: $1" >&2; exit 2;; esac; shift; done
+INSTANCE="${INSTANCE:-default}"
+[[ "$INSTANCE" =~ ^[a-z0-9][a-z0-9_-]{0,31}$ ]] || { echo "bad --instance '$INSTANCE' (a-z 0-9 _ -)" >&2; exit 2; }
+ROOT="${BRIDGE_ROOT:-}"   # test hook: install under a fake root (no systemd actions)
+PREFIX="${BRIDGE_PREFIX:-$ROOT/opt/$BASE}"
+LARK_BIN="${LARK_BIN:-$ROOT/usr/local/bin/lark-cli}"
+UNIT_DIR="${BRIDGE_UNIT_DIR:-$ROOT/etc/systemd/system}"
+if [ "$INSTANCE" = default ]; then
+  NAME=$BASE
+  ENV_FILE="${BRIDGE_ENV_FILE:-$ROOT/etc/$BASE.env}"
+  WORK="${BRIDGE_WORK_DIR:-$ROOT/var/lib/$BASE}"
+else
+  NAME=$BASE-$INSTANCE
+  ENV_FILE="${BRIDGE_ENV_FILE:-$ROOT/etc/$NAME.env}"
+  WORK="${BRIDGE_WORK_DIR:-$ROOT/var/lib/$BASE/$INSTANCE}"
+fi
+UNIT="$UNIT_DIR/$NAME.service"
 
 c_g=$'\e[32m'; c_y=$'\e[33m'; c_r=$'\e[31m'; c_0=$'\e[0m'
 info(){ echo "${c_g}==>${c_0} $*"; }
@@ -55,10 +74,10 @@ validate(){ # validate VAR regex hint
 
 # ---------- checks ----------
 [ "$(uname -s)" = Linux ] || die "Linux only"
-if [ "$(id -u)" != 0 ] && [ "$DRY_RUN" != 1 ]; then die "请用 root 运行：curl -fsSL ... | sudo bash"; fi
+if [ "$(id -u)" != 0 ] && [ "$DRY_RUN" != 1 ] && [ -z "$ROOT" ]; then die "请用 root 运行：curl -fsSL ... | sudo bash"; fi
 case "$(uname -m)" in x86_64|amd64) ARCH=amd64;; aarch64|arm64) ARCH=arm64;; *) die "unsupported arch $(uname -m)";; esac
-HAS_SYSTEMD=0; [ -d /run/systemd/system ] && command -v systemctl >/dev/null && HAS_SYSTEMD=1
-info "arch=$ARCH systemd=$HAS_SYSTEMD dry_run=$DRY_RUN"
+HAS_SYSTEMD=0; [ -z "$ROOT" ] && [ -d /run/systemd/system ] && command -v systemctl >/dev/null && HAS_SYSTEMD=1
+info "instance=$INSTANCE service=$NAME arch=$ARCH systemd=$HAS_SYSTEMD dry_run=$DRY_RUN"
 
 # ---------- packages ----------
 need=(); for c in python3 curl tar gzip flock sha256sum; do command -v "$c" >/dev/null || need+=("$c"); done
@@ -86,7 +105,7 @@ else
   if [ -f "$url" ]; then cp "$url" "$TMP/src.tgz"; else curl -fsSL --retry 3 "$url" -o "$TMP/src.tgz" || die "download failed (try GH_PROXY=...)"; fi
   tar --no-same-owner -xzf "$TMP/src.tgz" -C "$TMP"; SRC=$(find "$TMP" -mindepth 1 -maxdepth 1 -type d | head -1)
 fi
-run mkdir -p "$PREFIX" "$WORK"
+run mkdir -p "$PREFIX" "$WORK" "$(dirname "$LARK_BIN")" "$(dirname "$ENV_FILE")"
 run cp -r "$SRC/bridge" "$SRC/scripts" "$PREFIX/"
 [ -f "$SRC/install.sh" ] && run cp "$SRC/install.sh" "$PREFIX/"
 [ -f "$SRC/.env.example" ] && run cp "$SRC/.env.example" "$PREFIX/"
@@ -99,7 +118,8 @@ install_lark(){
   else curl -fsSL --retry 3 "${GH_PROXY}https://github.com/$REPO/releases/download/$LARK_TAG/$f" -o "$gz" || rm -f "$gz"; fi
   if [ -s "$gz" ]; then
     if [ -f "$sums" ]; then (cd "$(dirname "$gz")" && grep " $f\$" "$sums" | sed "s# $f\$# lark-cli.gz#" | sha256sum -c --quiet -) || die "lark-cli checksum mismatch"; fi
-    gunzip -c "$gz" > "$TMP/lark-cli" && install -m 755 "$TMP/lark-cli" "$LARK_BIN" && return 0
+    # write next to target then rename, so a lark-cli used by another running instance is never half-written
+    gunzip -c "$gz" > "$TMP/lark-cli" && install -m 755 "$TMP/lark-cli" "$LARK_BIN.new" && mv -f "$LARK_BIN.new" "$LARK_BIN" && return 0
   fi
   warn "patched lark-cli unavailable; falling back to official npm @larksuite/cli (no ws read-deadline patch)"
   command -v npm >/dev/null || { if command -v apt-get >/dev/null; then apt-get install -y nodejs npm; else (dnf install -y nodejs npm || yum install -y nodejs npm); fi; }
@@ -112,16 +132,24 @@ if [ "$DRY_RUN" = 1 ]; then echo "[dry-run] install lark-cli-linux-$ARCH (bundle
 
 # ---------- answers ----------
 # shellcheck disable=SC1090
-OLD_APP=""; OLD_OWN=""; OLD_BOT=""; OLD_URL=""; OLD_KEY=""
+OLD_APP=""; OLD_OWN=""; OLD_BOT=""; OLD_URL=""; OLD_KEY=""; OLD_NAME=""; OLD_GP2P=""
 if [ -r "$ENV_FILE" ]; then
   info "found existing $ENV_FILE (回车保留旧值)"
   OLD_APP=$(sed -n 's/^FEISHU_APP_ID=//p' "$ENV_FILE"); OLD_OWN=$(sed -n 's/^FEISHU_OWNER_OPEN_IDS=//p' "$ENV_FILE")
   OLD_BOT=$(sed -n 's/^FEISHU_BOT_OPEN_ID=//p' "$ENV_FILE"); OLD_URL=$(sed -n 's/^FEISHU_WEBHOOK_URL=//p' "$ENV_FILE")
   OLD_KEY=$(sed -n 's/^FEISHU_WEBHOOK_KEY=//p' "$ENV_FILE")
+  OLD_NAME=$(sed -n 's/^FEISHU_APP_NAME=//p' "$ENV_FILE"); OLD_GP2P=$(sed -n 's/^FEISHU_GUEST_P2P=//p' "$ENV_FILE")
 fi
+DEF_NAME=$INSTANCE; [ "$INSTANCE" = default ] && DEF_NAME=""   # empty -> payload "app" falls back to App ID
+FEISHU_APP_NAME="${APP_NAME_ARG:-${OLD_NAME:-$DEF_NAME}}"
+FEISHU_GUEST_P2P="${GUEST_P2P_ARG:-${OLD_GP2P:-0}}"
 LCFG="$WORK/lark-cli"
 echo; echo "请准备：App ID / App Secret（飞书开放平台 → 应用 → 凭证与基础信息）、你的 open_id、webhook URL 与 key"
 ask FEISHU_APP_ID "飞书 App ID (cli_...)" "$OLD_APP"; validate FEISHU_APP_ID '^cli_[A-Za-z0-9]+$' "cli_..."
+for other in "$ROOT"/etc/$BASE.env "$ROOT"/etc/$BASE-*.env; do
+  [ -r "$other" ] && [ "$other" != "$ENV_FILE" ] || continue
+  [ "$(sed -n 's/^FEISHU_APP_ID=//p' "$other")" = "$FEISHU_APP_ID" ] && die "App $FEISHU_APP_ID 已被 $other 使用；一个飞书应用只能有一个实例"
+done
 SECRET_DEF=""; [ -n "$OLD_APP" ] && [ "$OLD_APP" = "$FEISHU_APP_ID" ] && [ -f "$LCFG/config.json" ] && SECRET_DEF="__keep__"
 ask FEISHU_APP_SECRET "飞书 App Secret（输入不显示）" "$SECRET_DEF" secret
 
@@ -166,6 +194,8 @@ FEISHU_OWNER_OPEN_IDS=$FEISHU_OWNER_OPEN_IDS
 FEISHU_BOT_OPEN_ID=$FEISHU_BOT_OPEN_ID
 FEISHU_WEBHOOK_URL=$FEISHU_WEBHOOK_URL
 FEISHU_WEBHOOK_KEY=$FEISHU_WEBHOOK_KEY
+FEISHU_APP_NAME=$FEISHU_APP_NAME
+FEISHU_GUEST_P2P=$FEISHU_GUEST_P2P
 BRIDGE_WORK_DIR=$WORK
 LARKSUITE_CLI_CONFIG_DIR=$LCFG
 LARK_CLI=$LARK_BIN
@@ -178,7 +208,7 @@ else [ -f "$ENV_FILE" ] && cp -p "$ENV_FILE" "$ENV_FILE.bak"; write_env "$ENV_FI
 
 # ---------- service ----------
 UNIT_TEXT="[Unit]
-Description=Feishu -> Grok Bot webhook bridge
+Description=Feishu -> Grok Bot webhook bridge ($INSTANCE)
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=0
@@ -200,7 +230,15 @@ if [ "$HAS_SYSTEMD" = 1 ]; then
   info "installing systemd unit $UNIT"
   if [ "$DRY_RUN" = 1 ]; then echo "[dry-run] $UNIT:"; echo "$UNIT_TEXT"
   else printf '%s\n' "$UNIT_TEXT" >"$UNIT"; systemctl daemon-reload; systemctl enable "$NAME" >/dev/null 2>&1
-    if [ "$NO_START" = 0 ]; then systemctl restart "$NAME"; sleep 5; fi
+    if [ "$NO_START" = 0 ]; then
+      systemctl restart "$NAME"
+      # code in $PREFIX is shared: restart the other already-running instances so they pick up the new version
+      for u in "$UNIT_DIR"/$BASE.service "$UNIT_DIR"/$BASE-*.service; do
+        [ -f "$u" ] || continue; s=$(basename "$u" .service); [ "$s" = "$NAME" ] && continue
+        systemctl is-active --quiet "$s" && { info "restarting $s (shared code updated)"; systemctl restart "$s" || warn "restart $s failed"; }
+      done
+      sleep 5
+    fi
   fi
 else
   warn "systemd not found; using fallback loop ($PREFIX/scripts/start.sh). It won't survive reboot; add to crontab: @reboot $PREFIX/scripts/start.sh"
@@ -210,6 +248,7 @@ fi
 # ---------- status ----------
 echo
 if [ "$DRY_RUN" = 1 ]; then info "dry-run complete, nothing changed"; exit 0; fi
+if [ -n "$ROOT" ]; then info "installed into test root $ROOT"; exit 0; fi
 if [ "$HAS_SYSTEMD" = 1 ]; then
   systemctl --no-pager --lines=0 status "$NAME" || true
   journalctl -u "$NAME" -n 15 --no-pager 2>/dev/null || true
@@ -217,12 +256,13 @@ if [ "$HAS_SYSTEMD" = 1 ]; then
   cat <<TXT
 
 常用命令：
+  服务名         $NAME
   查看实时日志   journalctl -u $NAME -f
   最近日志       journalctl -u $NAME -n 100 --no-pager
   状态/重启/停止 systemctl status|restart|stop $NAME
   事件总线状态   LARKSUITE_CLI_CONFIG_DIR=$LCFG $LARK_BIN event status
   修改配置       编辑 $ENV_FILE 后 systemctl restart $NAME（webhook key 修改无需重启）
-  重新安装/升级  再次运行同一条 curl 命令（回车保留旧值）
+  重新安装/升级  再次运行同一条 curl 命令（回车保留旧值）（实例 $INSTANCE）
 TXT
 else
   info "日志：tail -f $WORK/forwarder.log"

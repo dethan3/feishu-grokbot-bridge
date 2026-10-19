@@ -28,6 +28,32 @@ systemctl status|restart|stop feishu-grokbot-bridge
 LARKSUITE_CLI_CONFIG_DIR=/var/lib/feishu-grokbot-bridge/lark-cli lark-cli event status
 ```
 
+### 多实例：一台服务器服务多个飞书应用
+
+每个飞书应用一个实例，代码共用 `/opt/feishu-grokbot-bridge`，每个实例有独立的配置、状态目录和 lark-cli 配置（事件总线互不干扰）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dethan3/feishu-grokbot-bridge/main/install.sh | sudo bash -s -- --instance xiaoi --app-name 小i --guest-p2p
+```
+
+| | 默认实例（不带 `--instance`） | 实例 `xiaoi` |
+|---|---|---|
+| systemd 服务 | `feishu-grokbot-bridge` | `feishu-grokbot-bridge-xiaoi` |
+| 配置文件 | `/etc/feishu-grokbot-bridge.env` | `/etc/feishu-grokbot-bridge-xiaoi.env` |
+| 状态目录 | `/var/lib/feishu-grokbot-bridge` | `/var/lib/feishu-grokbot-bridge/xiaoi` |
+| lark-cli 配置 | `/var/lib/feishu-grokbot-bridge/lark-cli` | `/var/lib/feishu-grokbot-bridge/xiaoi/lark-cli` |
+
+- `--app-name`：webhook 载荷里 `app` 字段的值（默认为实例名）；`--guest-p2p`：非主人的单聊消息也转发（`role=guest`），默认关闭。两者都会写入配置文件，重复运行时保留。
+- 同一个 App ID 不能配置到两个实例（安装脚本会拒绝）。
+- 重新运行任意实例的安装命令都会升级共享代码，并自动重启其它正在运行的实例。
+
+```bash
+sudo systemctl status feishu-grokbot-bridge-xiaoi       # 状态
+sudo journalctl -u feishu-grokbot-bridge-xiaoi -f       # 实时日志
+sudo systemctl restart feishu-grokbot-bridge-xiaoi      # 重启
+sudo LARKSUITE_CLI_CONFIG_DIR=/var/lib/feishu-grokbot-bridge/xiaoi/lark-cli lark-cli event status
+```
+
 **注意：同一个飞书应用只能有一个消费者。** 新服务器跑起来后，务必停掉其它机器上的旧转发器，否则事件会被两边分摊。
 
 ## 它做什么
@@ -38,8 +64,10 @@ LARKSUITE_CLI_CONFIG_DIR=/var/lib/feishu-grokbot-bridge/lark-cli lark-cli event 
 - **轮询兜底**：每 90 秒用 API 拉取已知群/会话最近 5 分钟的消息，补发长连接漏掉的
 - 以 `Authorization: Bearer $FEISHU_WEBHOOK_KEY` POST：
   ```json
-  {"message_id":"om_...","chat_id":"oc_...","chat_type":"p2p|group","sender_open_id":"ou_...","role":"owner|guest",
-   "message_type":"text","text":"...","create_time":"1700000000000"}
+  {"app":"小i","app_id":"cli_...","message_id":"om_...","event_id":null,"chat_id":"oc_...","chat_type":"p2p|group",
+   "sender_open_id":"ou_...","role":"owner|guest","sender_type":"owner|guest","is_owner":true,"bot_mentioned":false,
+   "message_type":"text","text":"...","mentions":[{"key":"@_user_1","open_id":"ou_...","name":"..."}],
+   "create_time":"1700000000000"}
   ```
 - 失败写入磁盘队列，每 60 秒按顺序重试；`scripts/reply.sh <chat_id> <message_id> <文本>` 以机器人身份回复，失败自动入队重试
 - **轻量 watchdog**（内置）：直连网络下依赖 SDK 自动重连；只有当 bus.log 出现断线且之后 60 秒内没有任何总线活动时，才停止事件总线并退出，由 systemd 3 秒后拉起
@@ -52,6 +80,7 @@ LARKSUITE_CLI_CONFIG_DIR=/var/lib/feishu-grokbot-bridge/lark-cli lark-cli event 
 | `FEISHU_OWNER_OPEN_IDS` | 主人 open_id，逗号分隔 |
 | `FEISHU_BOT_OPEN_ID` | 机器人 open_id（识别 @bot、跳过自身消息） |
 | `FEISHU_WEBHOOK_URL` / `FEISHU_WEBHOOK_KEY` | Grok Bot webhook 地址 / Bearer key（每次发送时重新读取，改 key 无需重启） |
+| `FEISHU_APP_NAME` / `FEISHU_GUEST_P2P` | 载荷 `app` 字段 / 是否转发非主人单聊（`1`/`0`，默认 `0`） |
 | `BRIDGE_WORK_DIR` | 状态目录，默认 `/var/lib/feishu-grokbot-bridge`（seen_ids、队列、chats.txt） |
 | `LARKSUITE_CLI_CONFIG_DIR` / `LARK_CLI` | lark-cli 配置目录 / 可执行文件 |
 | 可选 | `FEISHU_SEED_CHATS` `POLL_EVERY`(90) `POLL_WINDOW`(300) `STALE_SEC`(900) `RETRY_EVERY`(60) `SEEN_MAX`(5000) `WATCHDOG_QUIET_AFTER_DISCONNECT`(60) `WATCHDOG_SILENCE_MAX`(0=关闭) `BRIDGE_LOG_FILE` |
@@ -100,4 +129,4 @@ bash install.sh --dry-run
 
 ## English
 
-One-line install on a Linux server (root): `curl -fsSL https://raw.githubusercontent.com/dethan3/feishu-grokbot-bridge/main/install.sh | sudo bash`. It installs python3 and a patched lark-cli (1.0.98 + oapi-sdk-go v3.12.2), prompts (via /dev/tty) for App ID, App Secret (hidden), owner open_id(s), bot open_id (auto-detected), webhook URL and key (hidden), writes `/etc/feishu-grokbot-bridge.env` (600), and runs the `feishu-grokbot-bridge` systemd service (`Restart=always`). Owners are forwarded everywhere; guests only in groups when they @bot or @all; own messages skipped; dedupe by message_id; messages older than 15 min skipped; 90 s polling backup; disk retry queue. Logs: `journalctl -u feishu-grokbot-bridge -f`. Only one consumer per Feishu app may run at a time. License: MIT.
+One-line install on a Linux server (root): `curl -fsSL https://raw.githubusercontent.com/dethan3/feishu-grokbot-bridge/main/install.sh | sudo bash`. It installs python3 and a patched lark-cli (1.0.98 + oapi-sdk-go v3.12.2), prompts (via /dev/tty) for App ID, App Secret (hidden), owner open_id(s), bot open_id (auto-detected), webhook URL and key (hidden), writes `/etc/feishu-grokbot-bridge.env` (600), and runs the `feishu-grokbot-bridge` systemd service (`Restart=always`). Owners are forwarded everywhere; guests only in groups when they @bot or @all; own messages skipped; dedupe by message_id; messages older than 15 min skipped; 90 s polling backup; disk retry queue. Logs: `journalctl -u feishu-grokbot-bridge -f`. Multiple apps on one server: `... | sudo bash -s -- --instance xiaoi --app-name 小i --guest-p2p` creates service `feishu-grokbot-bridge-xiaoi` with `/etc/feishu-grokbot-bridge-xiaoi.env` and its own lark-cli config dir. Only one consumer per Feishu app may run at a time. License: MIT.

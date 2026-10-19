@@ -55,3 +55,16 @@ def test_queue_on_failure(tmp_path, monkeypatch):
 def test_render_post():
     raw = json.dumps({"zh_cn": {"title": "T", "content": [[{"tag": "text", "text": "a"}, {"tag": "at", "user_name": "B"}]]}})
     assert fw.render_content("post", raw) == "T\na@B"
+
+
+def test_guest_p2p_and_payload():
+    o = {OWNER}
+    assert fw.classify(ev(sender_id=GUEST), o, BOT, True)[0] == "guest"
+    assert fw.classify(ev(sender_id=GUEST, chat_type="group"), o, BOT, True)[0] is None
+    c = {"FEISHU_APP_ID": "cli_x", "FEISHU_APP_NAME": "小i", "FEISHU_BOT_OPEN_ID": BOT}
+    p = fw.build_payload(ev(chat_type="group", mentions=[{"id": BOT, "key": "@_user_1", "name": "小i"}]), "owner", c)
+    for k in ("app", "app_id", "message_id", "event_id", "chat_id", "chat_type", "sender_open_id", "role",
+              "sender_type", "is_owner", "bot_mentioned", "message_type", "text", "mentions", "create_time"):
+        assert k in p
+    assert p["app"] == "小i" and p["is_owner"] is True and p["bot_mentioned"] is True
+    assert p["mentions"] == [{"key": "@_user_1", "open_id": BOT, "name": "小i"}]

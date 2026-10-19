@@ -17,6 +17,7 @@ ALL_KEYS = {"@_all", "all"}
 DEFAULTS = {
     "FEISHU_APP_ID": "", "FEISHU_OWNER_OPEN_IDS": "", "FEISHU_BOT_OPEN_ID": "",
     "FEISHU_WEBHOOK_URL": "", "FEISHU_WEBHOOK_KEY": "", "FEISHU_SEED_CHATS": "",
+    "FEISHU_APP_NAME": "", "FEISHU_GUEST_P2P": "0",
     "BRIDGE_WORK_DIR": "/var/lib/feishu-grokbot-bridge", "LARK_CLI": "lark-cli", "LARK_CLI_EXTRA_ARGS": "",
     "LARKSUITE_CLI_CONFIG_DIR": "", "BRIDGE_LOG_FILE": "",
     "RETRY_EVERY": "60", "SEEN_MAX": "5000", "POLL_EVERY": "90", "POLL_WINDOW": "300", "STALE_SEC": "900",
@@ -51,6 +52,7 @@ def load_config(env_file, environ=None):
     c.update({k: v for k, v in parse_env_file(env_file).items() if k in DEFAULTS})
     c["owners"] = {x.strip() for x in c["FEISHU_OWNER_OPEN_IDS"].split(",") if x.strip()}
     c["seed_chats"] = [x.strip() for x in c["FEISHU_SEED_CHATS"].split(",") if x.strip().startswith("oc_")]
+    c["guest_p2p"] = str(c["FEISHU_GUEST_P2P"]).strip().lower() in ("1", "true", "yes", "on")
     for k in ("RETRY_EVERY", "SEEN_MAX", "POLL_EVERY", "POLL_WINDOW", "STALE_SEC", "WATCHDOG_EVERY",
               "WATCHDOG_QUIET_AFTER_DISCONNECT", "WATCHDOG_SILENCE_MAX"):
         c[k] = int(c[k] or DEFAULTS[k])
@@ -69,8 +71,8 @@ def is_mentioned(ev, bot_open_id):
     return False
 
 
-def classify(ev, owners, bot_open_id):
-    """Return (role or None, reason)."""
+def classify(ev, owners, bot_open_id, guest_p2p=False):
+    """Return (role or None, reason). guest_p2p: also forward non-owner direct (p2p) messages."""
     sender = ev.get("sender_id") or ""
     if bot_open_id and sender == bot_open_id:
         return None, "self"
@@ -80,6 +82,8 @@ def classify(ev, owners, bot_open_id):
             return None, "owner in group without @bot"
         return "owner", "owner"
     if not in_group:
+        if guest_p2p and ev.get("chat_type") == "p2p":
+            return "guest", "guest p2p"
         return None, "guest outside group"
     if not is_mentioned(ev, bot_open_id):
         return None, "guest without @bot/@all"
@@ -122,10 +126,27 @@ def normalize_polled(item):
             "create_time": item.get("create_time"), "_via": "poll"}
 
 
-def build_payload(ev, role):
-    return {"message_id": ev.get("message_id") or ev.get("id"), "chat_id": ev.get("chat_id"),
-            "chat_type": ev.get("chat_type"), "sender_open_id": ev.get("sender_id") or "", "role": role,
-            "message_type": ev.get("message_type"), "text": ev.get("content", ""), "create_time": ev.get("create_time")}
+def norm_mentions(ev):
+    out = []
+    for m in ev.get("mentions") or []:
+        if not isinstance(m, dict):
+            continue
+        mid = m.get("id")
+        oid = mid.get("open_id") if isinstance(mid, dict) else (m.get("open_id") or mid)
+        out.append({"key": m.get("key"), "open_id": oid, "name": m.get("name")})
+    return out
+
+
+def build_payload(ev, role, c=None):
+    c = c or {}
+    bot = c.get("FEISHU_BOT_OPEN_ID", "")
+    return {"app": c.get("FEISHU_APP_NAME") or c.get("FEISHU_APP_ID") or "", "app_id": c.get("FEISHU_APP_ID", ""),
+            "message_id": ev.get("message_id") or ev.get("id"), "event_id": ev.get("event_id"),
+            "chat_id": ev.get("chat_id"), "chat_type": ev.get("chat_type"),
+            "sender_open_id": ev.get("sender_id") or "", "role": role, "sender_type": role,
+            "is_owner": role == "owner", "bot_mentioned": is_mentioned(ev, bot),
+            "message_type": ev.get("message_type"), "text": ev.get("content", ""),
+            "mentions": norm_mentions(ev), "create_time": ev.get("create_time")}
 
 
 class Seen:
@@ -230,7 +251,7 @@ class Bridge:
         mid = ev.get("message_id") or ev.get("id")
         if not mid:
             return "no id"
-        role, why = classify(ev, self.c["owners"], self.c["FEISHU_BOT_OPEN_ID"])
+        role, why = classify(ev, self.c["owners"], self.c["FEISHU_BOT_OPEN_ID"], self.c["guest_p2p"])
         if role is None:
             log.info("skip %s from %s: %s", mid, ev.get("sender_id"), why); return "skip"
         if not self.seen.add(mid):
@@ -238,7 +259,7 @@ class Bridge:
         age = msg_age_sec(ev.get("create_time"))
         if age > self.c["STALE_SEC"]:
             log.warning("stale skip %s age=%.0fs", mid, age); return "stale"
-        payload = build_payload(ev, role)
+        payload = build_payload(ev, role, self.c)
         with self.qlock:
             backlog = bool(queued(self.whq))
         ok, info = (False, "backlog pending (preserve order)") if backlog else self.post(payload)
